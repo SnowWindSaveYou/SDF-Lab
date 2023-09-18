@@ -1,0 +1,349 @@
+#pragma kernel InitPlaneSDFTex
+#pragma kernel DrawCircle
+#pragma kernel RubCircle
+#pragma kernel MinErosion
+#pragma kernel MinErosionPrePocess
+#pragma kernel MinErosionPostPocess
+#pragma kernel AddValue
+#pragma kernel LipschitzProcess
+#pragma kernel TempToSDFTex
+#pragma kernel MixToOffset
+#pragma kernel InitZeroPlaneVisitTex
+#pragma kernel SmoothCircle
+
+RWTexture2D<float> _PlaneSDFTex;
+RWTexture2D<float> _TempPlaneSDFTex;
+
+SamplerState linear_clamp_sampler;
+
+float2 _InputUV;
+float _InputRadius;
+float _InputFloat;
+float _testVal;
+
+float2 _Direction;
+float _Step;
+float _Smooth;
+float _Resolution = 512;
+
+
+float linear_blend(float d1, float d2, float a=0.5)
+{
+    return a * d1 + (1 - a) * d2;
+}
+
+//todo
+float smooth_min_exp(float a, float b, float k = 32)
+{
+    float res = exp(-k*a) + exp(-k*b);
+    return -log(max(0.0001,res)) / k;
+}
+
+//todo
+float smooth_min_poly( float a, float b, float k =0.1) {
+    float h = clamp( 0.5 + 0.5*(b-a)/k, 0.0, 1.0 );
+    return linear_blend( b, a, h ) - k*h*(1.0-h); 
+}
+
+float smooth_min_poly2(float a, float b, float k = 32)
+{
+    float h = max( k-abs(a-b), 0.0 )/k;
+    return min( a, b ) - h*h*h*k*(1.0/6.0);
+}
+
+float smin(float a, float b, float k=0.5) {
+     float h = clamp(0.5 + 0.5 * (a - b) / k, 0.0, 1.0);
+     return lerp(a, b, h) - k * h * (1.0 - h);
+}
+
+float smin2(float a, float b, float k=0.5) {
+     float fk = pow(max(k-abs(a-b),0),3)/(6*k*k);
+     return min(a,b)- fk;
+}
+
+float smin3(float a, float b, float k=0.5) {
+       
+     float h = clamp(0.5 +0.5 * (a - b) / k, 0.0, 1.0);//(a-b) < 0.5 h = 0
+
+     return lerp(a, b, h) - k * h * (1.0 - h);
+}
+
+
+float sampleSDF(int2 id){
+    if(any(id<0)||any(id>=_Resolution)){
+        return 1024;
+    }
+    return _PlaneSDFTex[id.xy] ;
+}
+
+[numthreads(8,8,1)]
+void InitPlaneSDFTex (uint3 id : SV_DispatchThreadID)
+{
+    _PlaneSDFTex[id.xy] = 1024;
+}
+
+[numthreads(8,8,1)]
+void InitZeroPlaneVisitTex (uint3 id : SV_DispatchThreadID)
+{
+    if(abs(_PlaneSDFTex[id.xy]) <1){
+        _TempPlaneSDFTex[id.xy]  = 1;
+        return;
+    }
+        
+    _TempPlaneSDFTex[id.xy] =0;
+}
+
+[numthreads(8,8,1)]
+void TempToSDFTex(uint3 id : SV_DispatchThreadID)
+{
+    _PlaneSDFTex[id.xy] = _TempPlaneSDFTex[id.xy] ;
+}
+
+
+
+[numthreads(8,8,1)]
+void DrawCircle(uint3 id : SV_DispatchThreadID)
+{
+    if(any(id.xyz>=_Resolution))return;// avoid exe twice at one dispatch
+
+    float dist = length(float2(id.xy)- _InputUV) - _InputRadius;//coord 0~512
+    float k = _Smooth;
+    float currDist = _PlaneSDFTex[id.xy];
+    float mixed;
+    //mixed= smin3(currDist,dist+_testVal*k,k);
+    mixed= min(currDist,dist);
+    _PlaneSDFTex[id.xy] = mixed;
+}
+
+[numthreads(8,8,1)]
+void RubCircle(uint3 id : SV_DispatchThreadID)
+{
+    if(any(id.xyz>=_Resolution))return;// avoid exe twice at one dispatch
+
+    float dist = length(float2(id.xy)- _InputUV) - _InputRadius;//coord 0~512
+    float k = _Smooth;
+    float currDist = _PlaneSDFTex[id.xy];
+    float mixed;
+    mixed= max(currDist,-dist);
+    _PlaneSDFTex[id.xy] = mixed;
+}
+
+[numthreads(8,8,1)]
+void AddValue(uint3 id : SV_DispatchThreadID)
+{
+    if(any(id.xyz>=_Resolution))return;// avoid exe twice at one dispatch
+
+    float dist = length(float2(id.xy)- _InputUV) - _InputRadius;//coord 0~_Resolution
+
+    if(dist<0){
+
+        _PlaneSDFTex[id.xy] = _PlaneSDFTex[id.xy] +_InputFloat*((dist/_InputRadius));
+    }
+    
+}
+
+float sampleLinear( RWTexture2D<float> tex,float2 uv){
+    //return tex.SampleLevel(linear_clamp_sampler,uv,0);
+    float res = 0;
+
+    float down = lerp( tex[int2(floor(uv.x),floor(uv.y))],
+                        tex[int2(ceil(uv.x),floor(uv.y))],
+                        frac(uv.x) );
+    float up = lerp( tex[int2(floor(uv.x),ceil(uv.y))],
+                        tex[int2(ceil(uv.x),ceil(uv.y))],
+                        frac(uv.x) );
+    return lerp(down, up,frac(uv.y));
+}
+
+[numthreads(8,8,1)]
+void MixToOffset(uint3 id : SV_DispatchThreadID)
+{
+    if(any(id.xyz>=_Resolution))return;// avoid exe twice at one dispatch
+
+    float dist = length(float2(id.xy)+0.5- _InputUV) - _InputRadius;//coord 0~512
+
+    float v1 = _PlaneSDFTex[id.xy];
+
+    if(dist<0){
+        
+
+        float w = (-dist/_InputRadius);
+        //float v2 = _PlaneSDFTex[(id.xy+_Direction*(-dist))];
+
+        float v2 = sampleLinear(_PlaneSDFTex,(float2(id.xy)+0.5+_Direction*(-dist))); 
+        _TempPlaneSDFTex[id.xy] = smin(v1,v2, -dist);
+    }else{
+        _TempPlaneSDFTex[id.xy] =v1 ;
+    }
+    
+}
+
+[numthreads(8,8,1)]
+void SmoothCircle(uint3 id : SV_DispatchThreadID)
+{
+    if(any(id.xyz>=_Resolution))return;// avoid exe twice at one dispatch
+
+    float dist = length(float2(id.xy)- _InputUV) - _InputRadius;//coord 0~512
+    if(dist>0)
+        return;
+    float k = _Smooth;
+    float currDist = _PlaneSDFTex[id.xy];
+
+    _PlaneSDFTex[id.xy] = sign(currDist)* sqrt(currDist*currDist+k);
+}
+
+
+
+bool isLipchitz(float currValue,int2 idx,int2 shift, out float value){
+    value = _PlaneSDFTex[idx+shift];
+    if(abs(currValue-value)<=length(shift)){
+        return true;
+    }  
+    return false;   
+}
+
+[numthreads(8, 8, 1)]
+void LipschitzProcess(uint3 id : SV_DispatchThreadID)
+{
+    int unLipschitzCount = 0;
+    float unLipschitzSum = 0;
+    float curr =  _PlaneSDFTex[id.xy];
+    float val = 0;
+    int count = 0;
+    const int halfRange = 1;
+    for(int i = -halfRange;i<=halfRange;i++){
+        for(int j = -halfRange;j<=halfRange;j++){
+            if(i==0&&j==0){
+                continue;
+            }
+            if(!isLipchitz(curr, id.xy,int2(i,j),val)){
+                unLipschitzCount+=1;
+                unLipschitzSum+=val;
+            }
+            count+=1;
+        }
+
+    }
+
+    if(unLipschitzCount>count/2){
+        _TempPlaneSDFTex[id.xy] = 0;
+        //_TempPlaneSDFTex[id.xy] = float(unLipschitzSum)/float(unLipschitzCount);
+        // _TempPlaneSDFTex[id.xy] = unLipschitzSum/float(4);
+
+        //_TempPlaneSDFTex[id.xy] = (up+down+left+right+upright+downleft+upleft+downright)/8.0;
+        //_TempPlaneSDFTex[id.xy] = (curr+up+down+left+right+upright+downleft+upleft+downright)/9.0;
+
+       // _TempPlaneSDFTex[id.xy] = (up+down+left+right)/4.0;
+        //_TempPlaneSDFTex[id.xy] = 0;
+        //_TempPlaneSDFTex[id.xy] = 12;//_PlaneSDFTex[id.xy] ;
+    }else{
+        _TempPlaneSDFTex[id.xy] =  _PlaneSDFTex[id.xy];
+    }  
+
+}
+
+[numthreads(8, 8, 1)]
+void MinErosion(uint3 id : SV_DispatchThreadID)
+{
+    if(any(id>=_Resolution))
+        return;
+    int2 DIR = int2(1,0);
+    int2 rightPos = id.xy + DIR.xy;
+    int2 leftPos = id.xy - DIR;
+    int2 upPos = id.xy + DIR.yx;
+    int2 downPos = id.xy - DIR.yx;
+
+    float curr = _PlaneSDFTex[id.xy];
+    int currSign = sign(curr);
+    float currVar = abs(curr);
+
+    float leftVar =  sampleSDF(leftPos) ;
+    float rightVar =  sampleSDF(rightPos) ;
+    float upVar =   sampleSDF(upPos) ;
+    float downVar =  sampleSDF(downPos) ;
+
+    float T1 = min(abs(leftVar),abs(rightVar));
+    float T2 = min(abs(upVar),abs(downVar));
+    float t;
+
+   // float delta = 2-pow(T1-T2,2);
+    if(abs(T1-T2)<1){//若不是基于正确的数据这里可能存在低估的情况
+    // if(delta>=0){ 
+        t = (T1+T2+sqrt(2-pow(T1-T2,2)))*0.5;
+    }
+    else{
+        t = min(T1,T2)+1.0;
+    }
+    currVar = min(t,currVar);
+        
+        
+    _TempPlaneSDFTex[id.xy] = currSign*currVar;
+
+}
+
+
+[numthreads(8, 8, 1)]
+void MinErosionPrePocess(uint3 id : SV_DispatchThreadID)
+{
+    if(any(id.xyz>=_Resolution))return;
+
+    float curr = _PlaneSDFTex[id.xy];
+    int currSign = sign(curr);
+
+    if(abs(curr)>1.5){
+        _PlaneSDFTex[id.xy] = currSign*512;
+    }
+
+    //TODO edge may not satisfied to Lipschitz condition
+    
+    
+}
+[numthreads(8, 8, 1)]
+void MinErosionPostPocess(uint3 id : SV_DispatchThreadID)
+{
+    if(any(id.xyz>=_Resolution))return;
+
+   // float curr = _PlaneSDFTex[id.xy];
+
+    // float leftVar =  _PlaneSDFTex[id.xy+int2(1,0)];
+    // if(abs(leftVar-curr)>1){
+    //      _PlaneSDFTex[id.xy] = 0;
+    //      return;
+    // }
+
+
+    //_PlaneSDFTex[id.xy] = sign(curr)*sqrt(abs(curr));
+
+
+    float curr = _PlaneSDFTex[id.xy];
+    if(abs(curr)>500)
+        return;
+    int currSign = sign(curr);
+
+    int2 DIR = int2(1,0);
+    for(int i =0;i<128;i+=8){
+        int2 leftPos = id.xy - i*DIR;
+        int2 rightPos = id.xy + i*DIR.xy;
+        int2 upPos = id.xy + i*DIR.yx;
+        int2 downPos = id.xy - i*DIR.yx;
+        float rightVar =  sampleSDF(rightPos) ;
+        float leftVar =  sampleSDF(leftPos) ;
+        float upVar =   sampleSDF(upPos) ;
+        float downVar =  sampleSDF(downPos) ;
+
+        if(abs(rightVar)<1000){
+            _PlaneSDFTex[rightPos]  = sign(rightVar)*min(abs(curr)+i, abs(rightVar));
+        }
+
+        if(abs(leftVar)<1000){
+            _PlaneSDFTex[leftPos]  = sign(leftVar)*min(abs(curr)+i,abs( leftVar));
+        }
+
+        if(abs(upVar)<1000){
+            _PlaneSDFTex[upPos]  = sign(upVar)*min(abs(curr)+i, abs(upVar));
+        }
+        if(abs(downVar)<1000){
+            _PlaneSDFTex[downPos]  = sign(downVar)* min(abs(curr)+i, abs(downVar));
+        }
+    }
+}
